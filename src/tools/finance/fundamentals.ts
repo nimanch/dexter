@@ -1,6 +1,9 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { callAlphaVantage } from './alphavantage-api.js';
+import { callFmp } from './fmp-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const FinancialStatementsInputSchema = z.object({
@@ -60,8 +63,31 @@ export const getIncomeStatements = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/income-statements/', params);
-    return formatToolResult(data.income_statements || {}, [url]);
+    return runWithFinanceProviderFallback('get_income_statements', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { data, url } = await callAlphaVantage('INCOME_STATEMENT', {
+          symbol: input.ticker.toUpperCase(),
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        if (input.period === 'ttm') {
+          throw unsupportedByProvider(provider, 'get_income_statements (TTM not implemented for FMP)');
+        }
+
+        const fmpPeriod = input.period === 'quarterly' ? 'quarter' : 'annual';
+        const { data, url } = await callFmp('/income-statement', {
+          symbol: input.ticker.toUpperCase(),
+          period: fmpPeriod,
+          limit: input.limit,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      const { data, url } = await callApi('/financials/income-statements/', params);
+      return formatToolResult(data.income_statements || {}, [url]);
+    });
   },
 });
 
@@ -71,8 +97,31 @@ export const getBalanceSheets = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/balance-sheets/', params);
-    return formatToolResult(data.balance_sheets || {}, [url]);
+    return runWithFinanceProviderFallback('get_balance_sheets', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { data, url } = await callAlphaVantage('BALANCE_SHEET', {
+          symbol: input.ticker.toUpperCase(),
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        if (input.period === 'ttm') {
+          throw unsupportedByProvider(provider, 'get_balance_sheets (TTM not implemented for FMP)');
+        }
+
+        const fmpPeriod = input.period === 'quarterly' ? 'quarter' : 'annual';
+        const { data, url } = await callFmp('/balance-sheet-statement', {
+          symbol: input.ticker.toUpperCase(),
+          period: fmpPeriod,
+          limit: input.limit,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      const { data, url } = await callApi('/financials/balance-sheets/', params);
+      return formatToolResult(data.balance_sheets || {}, [url]);
+    });
   },
 });
 
@@ -82,8 +131,31 @@ export const getCashFlowStatements = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/cash-flow-statements/', params);
-    return formatToolResult(data.cash_flow_statements || {}, [url]);
+    return runWithFinanceProviderFallback('get_cash_flow_statements', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { data, url } = await callAlphaVantage('CASH_FLOW', {
+          symbol: input.ticker.toUpperCase(),
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        if (input.period === 'ttm') {
+          throw unsupportedByProvider(provider, 'get_cash_flow_statements (TTM not implemented for FMP)');
+        }
+
+        const fmpPeriod = input.period === 'quarterly' ? 'quarter' : 'annual';
+        const { data, url } = await callFmp('/cash-flow-statement', {
+          symbol: input.ticker.toUpperCase(),
+          period: fmpPeriod,
+          limit: input.limit,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      const { data, url } = await callApi('/financials/cash-flow-statements/', params);
+      return formatToolResult(data.cash_flow_statements || {}, [url]);
+    });
   },
 });
 
@@ -93,8 +165,51 @@ export const getAllFinancialStatements = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/', params);
-    return formatToolResult(data.financials || {}, [url]);
+    return runWithFinanceProviderFallback('get_all_financial_statements', async (provider) => {
+      if (provider === 'alphavantage') {
+        const symbol = input.ticker.toUpperCase();
+        const [income, balance, cash] = await Promise.all([
+          callAlphaVantage('INCOME_STATEMENT', { symbol }),
+          callAlphaVantage('BALANCE_SHEET', { symbol }),
+          callAlphaVantage('CASH_FLOW', { symbol }),
+        ]);
+
+        return formatToolResult(
+          {
+            income_statement: income.data,
+            balance_sheet: balance.data,
+            cash_flow: cash.data,
+          },
+          [income.url, balance.url, cash.url]
+        );
+      }
+
+      if (provider === 'fmp') {
+        if (input.period === 'ttm') {
+          throw unsupportedByProvider(provider, 'get_all_financial_statements (TTM not implemented for FMP)');
+        }
+
+        const symbol = input.ticker.toUpperCase();
+        const fmpPeriod = input.period === 'quarterly' ? 'quarter' : 'annual';
+        const [income, balance, cash] = await Promise.all([
+          callFmp('/income-statement', { symbol, period: fmpPeriod, limit: input.limit }),
+          callFmp('/balance-sheet-statement', { symbol, period: fmpPeriod, limit: input.limit }),
+          callFmp('/cash-flow-statement', { symbol, period: fmpPeriod, limit: input.limit }),
+        ]);
+
+        return formatToolResult(
+          {
+            income_statement: income.data,
+            balance_sheet: balance.data,
+            cash_flow: cash.data,
+          },
+          [income.url, balance.url, cash.url]
+        );
+      }
+
+      const { data, url } = await callApi('/financials/', params);
+      return formatToolResult(data.financials || {}, [url]);
+    });
   },
 });
 

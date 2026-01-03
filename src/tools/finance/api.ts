@@ -1,5 +1,7 @@
 const BASE_URL = 'https://api.financialdatasets.ai';
 
+import { MissingProviderApiKeyError } from './errors.js';
+
 export interface ApiResponse {
   data: Record<string, unknown>;
   url: string;
@@ -11,6 +13,12 @@ export async function callApi(
 ): Promise<ApiResponse> {
   // Read API key lazily at call time (after dotenv has loaded)
   const FINANCIAL_DATASETS_API_KEY = process.env.FINANCIAL_DATASETS_API_KEY;
+  if (!FINANCIAL_DATASETS_API_KEY || !FINANCIAL_DATASETS_API_KEY.trim() || FINANCIAL_DATASETS_API_KEY.trim().startsWith('your-')) {
+    throw new MissingProviderApiKeyError(
+      'financialdatasets',
+      'FINANCIAL_DATASETS_API_KEY is required when using the financialdatasets provider. Set it in your .env file.'
+    );
+  }
   const url = new URL(`${BASE_URL}${endpoint}`);
 
   // Add params to URL, handling arrays
@@ -26,7 +34,7 @@ export async function callApi(
 
   const response = await fetch(url.toString(), {
     headers: {
-      'x-api-key': FINANCIAL_DATASETS_API_KEY || '',
+      'x-api-key': FINANCIAL_DATASETS_API_KEY,
     },
   });
 

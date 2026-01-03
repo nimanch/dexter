@@ -1,6 +1,9 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { callAlphaVantage, toIntradayInterval } from './alphavantage-api.js';
+import { callFmp } from './fmp-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const PriceSnapshotInputSchema = z.object({
@@ -16,9 +19,23 @@ export const getPriceSnapshot = new DynamicStructuredTool({
   description: `Fetches the most recent price snapshot for a specific stock ticker, including the latest price, trading volume, and other open, high, low, and close price data.`,
   schema: PriceSnapshotInputSchema,
   func: async (input) => {
-    const params = { ticker: input.ticker };
-    const { data, url } = await callApi('/prices/snapshot/', params);
-    return formatToolResult(data.snapshot || {}, [url]);
+    return runWithFinanceProviderFallback('get_price_snapshot', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { data, url } = await callAlphaVantage('GLOBAL_QUOTE', {
+          symbol: input.ticker.toUpperCase(),
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        const { data, url } = await callFmp('/quote', { symbol: input.ticker.toUpperCase() });
+        return formatToolResult(data, [url]);
+      }
+
+      const params = { ticker: input.ticker };
+      const { data, url } = await callApi('/prices/snapshot/', params);
+      return formatToolResult(data.snapshot || {}, [url]);
+    });
   },
 });
 
@@ -45,15 +62,69 @@ export const getPrices = new DynamicStructuredTool({
   description: `Retrieves historical price data for a stock over a specified date range, including open, high, low, close prices, and volume.`,
   schema: PricesInputSchema,
   func: async (input) => {
-    const params = {
-      ticker: input.ticker,
-      interval: input.interval,
-      interval_multiplier: input.interval_multiplier,
-      start_date: input.start_date,
-      end_date: input.end_date,
-    };
-    const { data, url } = await callApi('/prices/', params);
-    return formatToolResult(data.prices || [], [url]);
+    return runWithFinanceProviderFallback('get_prices', async (provider) => {
+      if (provider === 'alphavantage') {
+        const symbol = input.ticker.toUpperCase();
+
+        if (input.interval === 'minute') {
+          const interval = toIntradayInterval(input.interval_multiplier);
+          const { data, url } = await callAlphaVantage(
+            'TIME_SERIES_INTRADAY',
+            { symbol, interval },
+            { outputsize: 'compact' }
+          );
+          return formatToolResult(data, [url]);
+        }
+
+        if (input.interval === 'day') {
+          const { data, url } = await callAlphaVantage(
+            'TIME_SERIES_DAILY_ADJUSTED',
+            { symbol },
+            { outputsize: 'compact' }
+          );
+          return formatToolResult(data, [url]);
+        }
+
+        if (input.interval === 'week') {
+          const { data, url } = await callAlphaVantage('TIME_SERIES_WEEKLY', { symbol });
+          return formatToolResult(data, [url]);
+        }
+
+        if (input.interval === 'month') {
+          const { data, url } = await callAlphaVantage('TIME_SERIES_MONTHLY', { symbol });
+          return formatToolResult(data, [url]);
+        }
+
+        // Best-effort: Alpha Vantage has no yearly time series function.
+        if (input.interval === 'year') {
+          const { data, url } = await callAlphaVantage('TIME_SERIES_MONTHLY', { symbol });
+          return formatToolResult(data, [url]);
+        }
+      }
+
+      if (provider === 'fmp') {
+        // FMP stable supports end-of-day historical prices.
+        if (input.interval !== 'day' || input.interval_multiplier !== 1) {
+          throw unsupportedByProvider(provider, 'get_prices (FMP supports daily EOD only)');
+        }
+        const { data, url } = await callFmp('/historical-price-eod/full', {
+          symbol: input.ticker.toUpperCase(),
+          from: input.start_date,
+          to: input.end_date,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      const params = {
+        ticker: input.ticker,
+        interval: input.interval,
+        interval_multiplier: input.interval_multiplier,
+        start_date: input.start_date,
+        end_date: input.end_date,
+      };
+      const { data, url } = await callApi('/prices/', params);
+      return formatToolResult(data.prices || [], [url]);
+    });
   },
 });
 

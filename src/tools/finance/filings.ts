@@ -2,6 +2,8 @@ import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
 import { ITEMS_10K_MAP, ITEMS_10Q_MAP, formatItemsDescription } from './constants.js';
+import { callFmp } from './fmp-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const FilingsInputSchema = z.object({
@@ -27,13 +29,43 @@ export const getFilings = new DynamicStructuredTool({
   description: `Retrieves metadata for SEC filings for a company. Returns accession numbers, filing types, and document URLs. This tool ONLY returns metadata - it does NOT return the actual text content from filings. To retrieve text content, use the specific filing items tools: get_10K_filing_items, get_10Q_filing_items, or get_8K_filing_items.`,
   schema: FilingsInputSchema,
   func: async (input) => {
-    const params: Record<string, string | number | undefined> = {
-      ticker: input.ticker,
-      limit: input.limit,
-      filing_type: input.filing_type,
-    };
-    const { data, url } = await callApi('/filings/', params);
-    return formatToolResult(data.filings || [], [url]);
+    return runWithFinanceProviderFallback('get_filings', async (provider) => {
+      if (provider === 'alphavantage') {
+        throw unsupportedByProvider(provider, 'get_filings');
+      }
+
+      if (provider === 'fmp') {
+        const { data, url } = await callFmp('/sec-filings-search/symbol', {
+          symbol: input.ticker.toUpperCase(),
+          limit: input.limit,
+        });
+
+        // Best-effort: filter by filing_type if present.
+        const filings = Array.isArray(data) ? data : (data as any)?.filings ?? data;
+
+        if (input.filing_type && Array.isArray(filings)) {
+          const filtered = filings.filter((f: any) => {
+            const form = String(f?.type ?? f?.formType ?? f?.form ?? f?.filingType ?? '').toUpperCase();
+            return form === input.filing_type;
+          });
+          return formatToolResult(filtered.slice(0, input.limit), [url]);
+        }
+
+        if (Array.isArray(filings)) {
+          return formatToolResult(filings.slice(0, input.limit), [url]);
+        }
+
+        return formatToolResult(filings ?? [], [url]);
+      }
+
+      const params: Record<string, string | number | undefined> = {
+        ticker: input.ticker,
+        limit: input.limit,
+        filing_type: input.filing_type,
+      };
+      const { data, url } = await callApi('/filings/', params);
+      return formatToolResult(data.filings || [], [url]);
+    });
   },
 });
 
@@ -53,14 +85,20 @@ export const get10KFilingItems = new DynamicStructuredTool({
   description: `Retrieves specific sections (items) from a company's 10-K annual report. Use this to extract detailed information from specific sections of a 10-K filing, such as: Item-1: Business, Item-1A: Risk Factors, Item-7: Management's Discussion and Analysis, Item-8: Financial Statements and Supplementary Data. The optional 'item' parameter allows you to filter for specific sections.`,
   schema: Filing10KItemsInputSchema,
   func: async (input) => {
-    const params: Record<string, string | number | string[] | undefined> = {
-      ticker: input.ticker.toUpperCase(),
-      filing_type: '10-K',
-      year: input.year,
-      item: input.item,
-    };
-    const { data, url } = await callApi('/filings/items/', params);
-    return formatToolResult(data, [url]);
+    return runWithFinanceProviderFallback('get_10K_filing_items', async (provider) => {
+      if (provider !== 'financialdatasets') {
+        throw unsupportedByProvider(provider, 'get_10K_filing_items');
+      }
+
+      const params: Record<string, string | number | string[] | undefined> = {
+        ticker: input.ticker.toUpperCase(),
+        filing_type: '10-K',
+        year: input.year,
+        item: input.item,
+      };
+      const { data, url } = await callApi('/filings/items/', params);
+      return formatToolResult(data, [url]);
+    });
   },
 });
 
@@ -81,15 +119,21 @@ export const get10QFilingItems = new DynamicStructuredTool({
   description: `Retrieves specific sections (items) from a company's 10-Q quarterly report. Use this to extract detailed information from specific sections of a 10-Q filing, such as: Item-1: Financial Statements, Item-2: Management's Discussion and Analysis, Item-3: Quantitative and Qualitative Disclosures About Market Risk, Item-4: Controls and Procedures.`,
   schema: Filing10QItemsInputSchema,
   func: async (input) => {
-    const params: Record<string, string | number | string[] | undefined> = {
-      ticker: input.ticker.toUpperCase(),
-      filing_type: '10-Q',
-      year: input.year,
-      quarter: input.quarter,
-      item: input.item,
-    };
-    const { data, url } = await callApi('/filings/items/', params);
-    return formatToolResult(data, [url]);
+    return runWithFinanceProviderFallback('get_10Q_filing_items', async (provider) => {
+      if (provider !== 'financialdatasets') {
+        throw unsupportedByProvider(provider, 'get_10Q_filing_items');
+      }
+
+      const params: Record<string, string | number | string[] | undefined> = {
+        ticker: input.ticker.toUpperCase(),
+        filing_type: '10-Q',
+        year: input.year,
+        quarter: input.quarter,
+        item: input.item,
+      };
+      const { data, url } = await callApi('/filings/items/', params);
+      return formatToolResult(data, [url]);
+    });
   },
 });
 
@@ -107,13 +151,19 @@ export const get8KFilingItems = new DynamicStructuredTool({
   description: `Retrieves specific sections (items) from a company's 8-K current report. 8-K filings report material events such as acquisitions, financial results, management changes, and other significant corporate events. The accession_number parameter can be retrieved using the get_filings tool by filtering for 8-K filings.`,
   schema: Filing8KItemsInputSchema,
   func: async (input) => {
-    const params: Record<string, string | undefined> = {
-      ticker: input.ticker.toUpperCase(),
-      filing_type: '8-K',
-      accession_number: input.accession_number,
-    };
-    const { data, url } = await callApi('/filings/items/', params);
-    return formatToolResult(data, [url]);
+    return runWithFinanceProviderFallback('get_8K_filing_items', async (provider) => {
+      if (provider !== 'financialdatasets') {
+        throw unsupportedByProvider(provider, 'get_8K_filing_items');
+      }
+
+      const params: Record<string, string | undefined> = {
+        ticker: input.ticker.toUpperCase(),
+        filing_type: '8-K',
+        accession_number: input.accession_number,
+      };
+      const { data, url } = await callApi('/filings/items/', params);
+      return formatToolResult(data, [url]);
+    });
   },
 });
 

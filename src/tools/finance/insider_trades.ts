@@ -1,6 +1,8 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { callFmp } from './fmp-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const InsiderTradesInputSchema = z.object({
@@ -38,16 +40,51 @@ export const getInsiderTrades = new DynamicStructuredTool({
   description: `Retrieves insider trading transactions for a given company ticker. Insider trades include purchases and sales of company stock by executives, directors, and other insiders. This data is sourced from SEC Form 4 filings. Use filing_date filters to narrow down results by date range.`,
   schema: InsiderTradesInputSchema,
   func: async (input) => {
-    const params: Record<string, string | number | undefined> = {
-      ticker: input.ticker.toUpperCase(),
-      limit: input.limit,
-      filing_date: input.filing_date,
-      filing_date_gte: input.filing_date_gte,
-      filing_date_lte: input.filing_date_lte,
-      filing_date_gt: input.filing_date_gt,
-      filing_date_lt: input.filing_date_lt,
-    };
-    const { data, url } = await callApi('/insider-trades/', params);
-    return formatToolResult(data.insider_trades || [], [url]);
+    return runWithFinanceProviderFallback('get_insider_trades', async (provider) => {
+      if (provider === 'alphavantage') {
+        throw unsupportedByProvider(provider, 'get_insider_trades');
+      }
+
+      if (provider === 'fmp') {
+        const { data, url } = await callFmp('/insider-trading/search', {
+          symbol: input.ticker.toUpperCase(),
+          limit: input.limit,
+          page: 0,
+        });
+
+        const rows = Array.isArray(data) ? data : ((data as any)?.insider_trades ?? (data as any)?.data ?? data);
+
+        // Best-effort local filtering for filing date constraints.
+        if (Array.isArray(rows)) {
+          const getDate = (r: any): string => String(r?.filingDate ?? r?.filing_date ?? r?.date ?? r?.transactionDate ?? '');
+          const inRange = (d: string): boolean => {
+            if (!d) return true;
+            if (input.filing_date && d !== input.filing_date) return false;
+            if (input.filing_date_gt && d <= input.filing_date_gt) return false;
+            if (input.filing_date_gte && d < input.filing_date_gte) return false;
+            if (input.filing_date_lt && d >= input.filing_date_lt) return false;
+            if (input.filing_date_lte && d > input.filing_date_lte) return false;
+            return true;
+          };
+
+          const filtered = rows.filter((r: any) => inRange(getDate(r)));
+          return formatToolResult(filtered.slice(0, input.limit), [url]);
+        }
+
+        return formatToolResult(rows ?? [], [url]);
+      }
+
+      const params: Record<string, string | number | undefined> = {
+        ticker: input.ticker.toUpperCase(),
+        limit: input.limit,
+        filing_date: input.filing_date,
+        filing_date_gte: input.filing_date_gte,
+        filing_date_lte: input.filing_date_lte,
+        filing_date_gt: input.filing_date_gt,
+        filing_date_lt: input.filing_date_lt,
+      };
+      const { data, url } = await callApi('/insider-trades/', params);
+      return formatToolResult(data.insider_trades || [], [url]);
+    });
   },
 });

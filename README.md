@@ -25,7 +25,9 @@ Dexter takes complex financial questions and turns them into clear, step-by-step
 
 - [Bun](https://bun.com) runtime (v1.0 or higher)
 - OpenAI API key (get [here](https://platform.openai.com/api-keys))
-- Financial Datasets API key (get [here](https://financialdatasets.ai))
+- Finance data API key:
+	- Financial Datasets (get [here](https://financialdatasets.ai))
+	- Alpha Vantage (get [here](https://www.alphavantage.co/support/#api-key))
 - Tavily API key (get [here](https://tavily.com)) - optional, for web search
 
 #### Installing Bun
@@ -67,7 +69,11 @@ cp env.example .env
 
 # Edit .env and add your API keys
 # OPENAI_API_KEY=your-openai-api-key
+# FINANCE_PROVIDERS=fmp,alphavantage,financialdatasets  # ordered primary, backups
+# FINANCE_PROVIDER=alphavantage  # legacy single-provider option
+# ALPHAVANTAGE_API_KEY=your-alpha-vantage-api-key
 # FINANCIAL_DATASETS_API_KEY=your-financial-datasets-api-key
+# FMP_API_KEY=your-financialmodelingprep-api-key
 # TAVILY_API_KEY=your-tavily-api-key
 ```
 

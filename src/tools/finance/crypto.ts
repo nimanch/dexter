@@ -1,6 +1,8 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { callAlphaVantage, parseCryptoTickerPair } from './alphavantage-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const CryptoPriceSnapshotInputSchema = z.object({
@@ -16,9 +18,24 @@ export const getCryptoPriceSnapshot = new DynamicStructuredTool({
   description: `Fetches the most recent price snapshot for a specific cryptocurrency, including the latest price, trading volume, and other open, high, low, and close price data. Ticker format: use 'CRYPTO-USD' for USD prices (e.g., 'BTC-USD') or 'CRYPTO-CRYPTO' for crypto-to-crypto prices (e.g., 'BTC-ETH' for Bitcoin priced in Ethereum).`,
   schema: CryptoPriceSnapshotInputSchema,
   func: async (input) => {
-    const params = { ticker: input.ticker };
-    const { data, url } = await callApi('/crypto/prices/snapshot/', params);
-    return formatToolResult(data.snapshot || {}, [url]);
+    return runWithFinanceProviderFallback('get_crypto_price_snapshot', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { from, to } = parseCryptoTickerPair(input.ticker);
+        const { data, url } = await callAlphaVantage('CURRENCY_EXCHANGE_RATE', {
+          from_currency: from,
+          to_currency: to,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        throw unsupportedByProvider(provider, 'get_crypto_price_snapshot');
+      }
+
+      const params = { ticker: input.ticker };
+      const { data, url } = await callApi('/crypto/prices/snapshot/', params);
+      return formatToolResult(data.snapshot || {}, [url]);
+    });
   },
 });
 
@@ -45,15 +62,36 @@ export const getCryptoPrices = new DynamicStructuredTool({
   description: `Retrieves historical price data for a cryptocurrency over a specified date range, including open, high, low, close prices, and volume. Ticker format: use 'CRYPTO-USD' for USD prices (e.g., 'BTC-USD') or 'CRYPTO-CRYPTO' for crypto-to-crypto prices (e.g., 'BTC-ETH' for Bitcoin priced in Ethereum).`,
   schema: CryptoPricesInputSchema,
   func: async (input) => {
-    const params = {
-      ticker: input.ticker,
-      interval: input.interval,
-      interval_multiplier: input.interval_multiplier,
-      start_date: input.start_date,
-      end_date: input.end_date,
-    };
-    const { data, url } = await callApi('/crypto/prices/', params);
-    return formatToolResult(data.prices || [], [url]);
+    return runWithFinanceProviderFallback('get_crypto_prices', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { from, to } = parseCryptoTickerPair(input.ticker);
+
+        // Best-effort: Alpha Vantage provides daily digital currency OHLC time series.
+        if (input.interval !== 'day' || input.interval_multiplier !== 1) {
+          throw unsupportedByProvider(provider, 'get_crypto_prices (only daily interval supported)');
+        }
+
+        const { data, url } = await callAlphaVantage('DIGITAL_CURRENCY_DAILY', {
+          symbol: from,
+          market: to,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        throw unsupportedByProvider(provider, 'get_crypto_prices');
+      }
+
+      const params = {
+        ticker: input.ticker,
+        interval: input.interval,
+        interval_multiplier: input.interval_multiplier,
+        start_date: input.start_date,
+        end_date: input.end_date,
+      };
+      const { data, url } = await callApi('/crypto/prices/', params);
+      return formatToolResult(data.prices || [], [url]);
+    });
   },
 });
 
@@ -62,7 +100,13 @@ export const getCryptoTickers = new DynamicStructuredTool({
   description: `Retrieves the list of available cryptocurrency tickers that can be used with the crypto price tools.`,
   schema: z.object({}),
   func: async () => {
-    const { data, url } = await callApi('/crypto/prices/tickers/', {});
-    return formatToolResult(data.tickers || [], [url]);
+    return runWithFinanceProviderFallback('get_available_crypto_tickers', async (provider) => {
+      if (provider !== 'financialdatasets') {
+        throw unsupportedByProvider(provider, 'get_available_crypto_tickers');
+      }
+
+      const { data, url } = await callApi('/crypto/prices/tickers/', {});
+      return formatToolResult(data.tickers || [], [url]);
+    });
   },
 });

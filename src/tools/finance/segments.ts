@@ -1,6 +1,8 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { callFmp } from './fmp-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const SegmentedRevenuesInputSchema = z.object({
@@ -22,13 +24,43 @@ export const getSegmentedRevenues = new DynamicStructuredTool({
   description: `Provides a detailed breakdown of a company's revenue by operating segments, such as products, services, or geographic regions. Useful for analyzing the composition of a company's revenue.`,
   schema: SegmentedRevenuesInputSchema,
   func: async (input) => {
-    const params = {
-      ticker: input.ticker,
-      period: input.period,
-      limit: input.limit,
-    };
-    const { data, url } = await callApi('/financials/segmented-revenues/', params);
-    return formatToolResult(data.segmented_revenues || {}, [url]);
+    return runWithFinanceProviderFallback('get_segmented_revenues', async (provider) => {
+      if (provider === 'alphavantage') {
+        throw unsupportedByProvider(provider, 'get_segmented_revenues');
+      }
+
+      if (provider === 'fmp') {
+        const fmpPeriod = input.period === 'quarterly' ? 'quarter' : 'annual';
+        const symbol = input.ticker.toUpperCase();
+
+        const [product, geographic] = await Promise.all([
+          callFmp('/revenue-product-segmentation', { symbol, period: fmpPeriod, structure: 'flat' }),
+          // Note: docs page may differ; endpoint is expected to exist.
+          callFmp('/revenue-geographic-segmentation', { symbol, period: fmpPeriod, structure: 'flat' }),
+        ]);
+
+        const slice = (d: Record<string, unknown>): unknown => {
+          if (Array.isArray(d)) return d.slice(0, input.limit);
+          return d;
+        };
+
+        return formatToolResult(
+          {
+            product: slice(product.data),
+            geographic: slice(geographic.data),
+          },
+          [product.url, geographic.url]
+        );
+      }
+
+      const params = {
+        ticker: input.ticker,
+        period: input.period,
+        limit: input.limit,
+      };
+      const { data, url } = await callApi('/financials/segmented-revenues/', params);
+      return formatToolResult(data.segmented_revenues || {}, [url]);
+    });
   },
 });
 

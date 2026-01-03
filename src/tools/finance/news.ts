@@ -1,6 +1,8 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { buildAlphaVantageNewsParams, callAlphaVantage } from './alphavantage-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const NewsInputSchema = z.object({
@@ -23,13 +25,30 @@ export const getNews = new DynamicStructuredTool({
   description: `Retrieves recent news articles for a given company ticker, covering financial announcements, market trends, and other significant events. Useful for staying up-to-date with market-moving information and investor sentiment.`,
   schema: NewsInputSchema,
   func: async (input) => {
-    const params: Record<string, string | number | undefined> = {
-      ticker: input.ticker,
-      limit: input.limit,
-      start_date: input.start_date,
-      end_date: input.end_date,
-    };
-    const { data, url } = await callApi('/news/', params);
-    return formatToolResult(data.news || [], [url]);
+    return runWithFinanceProviderFallback('get_news', async (provider) => {
+      if (provider === 'alphavantage') {
+        const params = buildAlphaVantageNewsParams({
+          ticker: input.ticker,
+          start_date: input.start_date,
+          end_date: input.end_date,
+          limit: input.limit,
+        });
+        const { data, url } = await callAlphaVantage('NEWS_SENTIMENT', params);
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        throw unsupportedByProvider(provider, 'get_news');
+      }
+
+      const params: Record<string, string | number | undefined> = {
+        ticker: input.ticker,
+        limit: input.limit,
+        start_date: input.start_date,
+        end_date: input.end_date,
+      };
+      const { data, url } = await callApi('/news/', params);
+      return formatToolResult(data.news || [], [url]);
+    });
   },
 });

@@ -1,6 +1,9 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { callApi } from './api.js';
+import { callAlphaVantage } from './alphavantage-api.js';
+import { callFmp } from './fmp-api.js';
+import { runWithFinanceProviderFallback, unsupportedByProvider } from './provider.js';
 import { formatToolResult } from '../types.js';
 
 const FinancialMetricsSnapshotInputSchema = z.object({
@@ -16,9 +19,23 @@ export const getFinancialMetricsSnapshot = new DynamicStructuredTool({
   description: `Fetches a snapshot of the most current financial metrics for a company, including key indicators like market capitalization, P/E ratio, and dividend yield. Useful for a quick overview of a company's financial health.`,
   schema: FinancialMetricsSnapshotInputSchema,
   func: async (input) => {
-    const params = { ticker: input.ticker };
-    const { data, url } = await callApi('/financial-metrics/snapshot/', params);
-    return formatToolResult(data.snapshot || {}, [url]);
+    return runWithFinanceProviderFallback('get_financial_metrics_snapshot', async (provider) => {
+      if (provider === 'alphavantage') {
+        const { data, url } = await callAlphaVantage('OVERVIEW', {
+          symbol: input.ticker.toUpperCase(),
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        const { data, url } = await callFmp('/quote', { symbol: input.ticker.toUpperCase() });
+        return formatToolResult(data, [url]);
+      }
+
+      const params = { ticker: input.ticker };
+      const { data, url } = await callApi('/financial-metrics/snapshot/', params);
+      return formatToolResult(data.snapshot || {}, [url]);
+    });
   },
 });
 
@@ -69,18 +86,44 @@ export const getFinancialMetrics = new DynamicStructuredTool({
   description: `Retrieves historical financial metrics for a company, such as P/E ratio, revenue per share, and enterprise value, over a specified period. Useful for trend analysis and historical performance evaluation.`,
   schema: FinancialMetricsInputSchema,
   func: async (input) => {
-    const params: Record<string, string | number | undefined> = {
-      ticker: input.ticker,
-      period: input.period,
-      limit: input.limit,
-      report_period: input.report_period,
-      report_period_gt: input.report_period_gt,
-      report_period_gte: input.report_period_gte,
-      report_period_lt: input.report_period_lt,
-      report_period_lte: input.report_period_lte,
-    };
-    const { data, url } = await callApi('/financial-metrics/', params);
-    return formatToolResult(data.financial_metrics || [], [url]);
+    return runWithFinanceProviderFallback('get_financial_metrics', async (provider) => {
+      if (provider === 'alphavantage') {
+        // Best-effort: Alpha Vantage does not provide this same endpoint; return raw company overview.
+        const { data, url } = await callAlphaVantage('OVERVIEW', {
+          symbol: input.ticker.toUpperCase(),
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      if (provider === 'fmp') {
+        const symbol = input.ticker.toUpperCase();
+        if (input.period === 'ttm') {
+          const { data, url } = await callFmp('/key-metrics-ttm', { symbol });
+          return formatToolResult(data, [url]);
+        }
+
+        const fmpPeriod = input.period === 'quarterly' ? 'quarter' : 'annual';
+        const { data, url } = await callFmp('/key-metrics', {
+          symbol,
+          period: fmpPeriod,
+          limit: input.limit,
+        });
+        return formatToolResult(data, [url]);
+      }
+
+      const params: Record<string, string | number | undefined> = {
+        ticker: input.ticker,
+        period: input.period,
+        limit: input.limit,
+        report_period: input.report_period,
+        report_period_gt: input.report_period_gt,
+        report_period_gte: input.report_period_gte,
+        report_period_lt: input.report_period_lt,
+        report_period_lte: input.report_period_lte,
+      };
+      const { data, url } = await callApi('/financial-metrics/', params);
+      return formatToolResult(data.financial_metrics || [], [url]);
+    });
   },
 });
 

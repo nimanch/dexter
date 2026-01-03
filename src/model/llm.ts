@@ -7,6 +7,7 @@ import { StructuredToolInterface } from '@langchain/core/tools';
 import { Runnable } from '@langchain/core/runnables';
 import { z } from 'zod';
 import { DEFAULT_SYSTEM_PROMPT } from '../agent/prompts.js';
+import { getLlmRateLimitConfigFromEnv, LlmRateLimiter } from './rate-limit.js';
 
 export const DEFAULT_MODEL = 'gpt-5.2';
 
@@ -27,18 +28,139 @@ function disableLangSmithTracingIfMisconfigured(): void {
 // Run once on module import so even small one-off scripts (bun -e ...) behave.
 disableLangSmithTracingIfMisconfigured();
 
-// Generic retry helper with exponential backoff
-async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+function parseEnvInt(name: string): number | undefined {
+  const raw = (process.env[name] ?? '').trim();
+  if (!raw) return undefined;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitError(err: unknown): boolean {
+  if (!err) return false;
+
+  const anyErr = err as Record<string, unknown>;
+  const message = String((anyErr.message ?? '') as string).toLowerCase();
+  const status = anyErr.status ?? (anyErr.response as Record<string, unknown> | undefined)?.status;
+
+  if (status === 429) return true;
+  if (message.includes('429')) return true;
+  if (message.includes('rate limit')) return true;
+  if (message.includes('too many requests')) return true;
+
+  return false;
+}
+
+function tryGetRetryAfterMs(err: unknown): number | undefined {
+  if (!err) return undefined;
+  const anyErr = err as Record<string, unknown>;
+
+  const tryParseRetryAfter = (value: unknown): number | undefined => {
+    if (value == null) return undefined;
+    const raw = String(value).trim();
+    if (!raw) return undefined;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.ceil(seconds * 1000);
+    }
+    return undefined;
+  };
+
+  // Common shapes: err.response.headers.get('retry-after') / err.headers['retry-after']
+  const response = anyErr.response as Record<string, unknown> | undefined;
+  const headers = (response?.headers ?? anyErr.headers ?? (anyErr.cause as Record<string, unknown> | undefined)?.headers) as
+    | Record<string, unknown>
+    | undefined;
+
+  const getHeader = (key: string): unknown => {
+    if (!headers) return undefined;
+
+    // Fetch Headers-like
+    const maybeGet = headers as unknown as { get?: (k: string) => string | null };
+    if (typeof maybeGet.get === 'function') {
+      return maybeGet.get(key);
+    }
+
+    // Plain object
+    const lowerKey = key.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lowerKey) return v;
+    }
+    return undefined;
+  };
+
+  const headerRetryAfter = getHeader('retry-after');
+  const parsed = tryParseRetryAfter(headerRetryAfter);
+  if (parsed != null) return parsed;
+
+  // Best-effort parse from message
+  const message = String((anyErr.message ?? '') as string);
+  const match = message.match(/retry\s*after\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds)?/i);
+  if (match) {
+    const n = Number(match[1]);
+    if (Number.isFinite(n) && n >= 0) return Math.ceil(n * 1000);
+  }
+
+  return undefined;
+}
+
+function getRetrySettingsFromEnv(): {
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitterRatio: number;
+} {
+  const maxAttempts = parseEnvInt('LLM_RETRY_MAX_ATTEMPTS') ?? 6;
+  const baseDelayMs = parseEnvInt('LLM_RETRY_BASE_DELAY_MS') ?? 750;
+  const maxDelayMs = parseEnvInt('LLM_RETRY_MAX_DELAY_MS') ?? 30000;
+  const jitterRatioRaw = (process.env.LLM_RETRY_JITTER_RATIO ?? '').trim();
+  const jitterRatio = jitterRatioRaw ? Number(jitterRatioRaw) : 0.2;
+
+  return {
+    maxAttempts: Math.max(1, maxAttempts),
+    baseDelayMs: Math.max(0, baseDelayMs),
+    maxDelayMs: Math.max(0, maxDelayMs),
+    jitterRatio: Number.isFinite(jitterRatio) && jitterRatio >= 0 ? jitterRatio : 0.2,
+  };
+}
+
+function withJitter(ms: number, ratio: number): number {
+  if (ms <= 0) return 0;
+  const jitter = Math.floor(ms * ratio * Math.random());
+  return ms + jitter;
+}
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const { maxAttempts, baseDelayMs, maxDelayMs, jitterRatio } = getRetrySettingsFromEnv();
+
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       return await fn();
     } catch (e) {
       if (attempt === maxAttempts - 1) throw e;
-      await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+
+      const retryAfterMs = tryGetRetryAfterMs(e);
+      const is429 = isRateLimitError(e);
+
+      const backoff = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+      const delayMs = retryAfterMs ?? (is429 ? Math.max(backoff, 1000) : backoff);
+      await sleep(withJitter(delayMs, jitterRatio));
     }
   }
+
   throw new Error('Unreachable');
 }
+
+function estimateTokensFromText(text: string): number {
+  // Heuristic: ~4 chars per token in English.
+  const chars = text.length;
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
+const globalRateLimiter = new LlmRateLimiter(getLlmRateLimitConfigFromEnv());
 
 // Model provider configuration
 interface ModelOpts {
@@ -150,7 +272,14 @@ export async function callLlm(prompt: string, options: CallLlmOptions = {}): Pro
 
   const chain = promptTemplate.pipe(runnable);
 
-  const result = await withRetry(() => chain.invoke({ prompt }));
+  const estimatedTokens =
+    estimateTokensFromText(prompt) +
+    estimateTokensFromText(finalSystemPrompt) +
+    (tools && tools.length > 0 ? 250 : 0);
+
+  const result = await globalRateLimiter.run(estimatedTokens, () =>
+    withRetry(() => chain.invoke({ prompt }))
+  );
 
   // If no outputSchema and no tools, extract content from AIMessage
   // When tools are provided, return the full AIMessage to preserve tool_calls
@@ -175,23 +304,45 @@ export async function* callLlmStream(
   const llm = getChatModel(model, true);
   const chain = promptTemplate.pipe(llm);
 
-  // For streaming, we handle retry at the connection level
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const stream = await chain.stream({ prompt });
+  const estimatedTokens = estimateTokensFromText(prompt) + estimateTokensFromText(finalSystemPrompt);
 
-      for await (const chunk of stream) {
-        if (chunk && typeof chunk === 'object' && 'content' in chunk) {
-          const content = chunk.content;
-          if (content && typeof content === 'string') {
-            yield content;
+  // For streaming, retry only if the connection fails before yielding any tokens.
+  const { maxAttempts } = getRetrySettingsFromEnv();
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let receivedAny = false;
+
+    try {
+      const release = await globalRateLimiter.acquirePermit(estimatedTokens);
+      try {
+        const stream = await chain.stream({ prompt });
+
+        for await (const chunk of stream) {
+          if (chunk && typeof chunk === 'object' && 'content' in chunk) {
+            const content = (chunk as { content?: unknown }).content;
+            if (typeof content === 'string' && content) {
+              receivedAny = true;
+              yield content;
+            }
           }
         }
+      } finally {
+        release();
       }
+
       return;
     } catch (e) {
-      if (attempt === 2) throw e;
-      await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+      // Don't retry mid-stream.
+      if (receivedAny) throw e;
+      if (attempt === maxAttempts - 1) throw e;
+
+      // Use the same 429-aware backoff.
+      const retryAfterMs = tryGetRetryAfterMs(e);
+      const is429 = isRateLimitError(e);
+      const { baseDelayMs, maxDelayMs, jitterRatio } = getRetrySettingsFromEnv();
+      const backoff = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+      const delayMs = retryAfterMs ?? (is429 ? Math.max(backoff, 1000) : backoff);
+      await sleep(withJitter(delayMs, jitterRatio));
     }
   }
 }
